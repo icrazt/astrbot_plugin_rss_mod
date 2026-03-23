@@ -39,8 +39,15 @@ class DataHandler:
     def parse_channel_text_info(self, text):
         """解析RSS频道信息"""
         root = etree.fromstring(text)
-        title = root.xpath("//title")[0].text
-        description = root.xpath("//description")[0].text
+        title_nodes = root.xpath("//channel/title")
+        description_nodes = root.xpath("//channel/description")
+
+        title = ((title_nodes[0].text if title_nodes else "") or "").strip()
+        description = ((description_nodes[0].text if description_nodes else "") or "").strip()
+
+        if not title:
+            title = "未知频道"
+
         return title, description
 
     def strip_html_pic(self, html)-> list[str]:

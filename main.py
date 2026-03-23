@@ -44,6 +44,8 @@ class RssPlugin(Star):
         self.is_adjust_pic= config.get("pic_config").get("is_adjust_pic")
         self.max_pic_item = config.get("pic_config").get("max_pic_item")
         self.is_compose = config.get("compose")
+        self.rsshub_base_url = self._normalize_rsshub_base_url(config.get("rsshub_base_url") or "")
+        self.rsshub_query_param = (config.get("rsshub_query_param") or "").strip()
 
         self.pic_handler = RssImageHandler(self.is_adjust_pic)
         self.scheduler = AsyncIOScheduler()
@@ -188,32 +190,57 @@ class RssPlugin(Star):
                     else "未知频道"
                 )
 
-                title = item.xpath("title")[0].text
+                title_nodes = item.xpath("title")
+                title = (title_nodes[0].text or "").strip() if title_nodes else ""
+                if not title:
+                    title = "(无标题)"
                 if len(title) > self.title_max_length:
                     title = title[: self.title_max_length] + "..."
 
-                link = item.xpath("link")[0].text
+                link_nodes = item.xpath("link")
+                link = (link_nodes[0].text or "").strip() if link_nodes else ""
+                if not link:
+                    self.logger.warning(f"rss: 条目缺少 link，已跳过: {url}")
+                    continue
                 if not re.match(r"^https?://", link):
                     link = self.data_handler.get_root_url(url) + link
 
-                description = item.xpath("description")[0].text
+                description_nodes = item.xpath("description")
+                description_html = (
+                    description_nodes[0].text if description_nodes else ""
+                ) or ""
 
-                pic_url_list = self.data_handler.strip_html_pic(description)
-                description = self.data_handler.strip_html(description)
+                pic_url_list = self.data_handler.strip_html_pic(description_html)
+                description = self.data_handler.strip_html(description_html).strip()
+                if not description:
+                    description = "(无描述)"
 
                 if len(description) > self.description_max_length:
                     description = (
                         description[: self.description_max_length] + "..."
                     )
 
-                if item.xpath("pubDate"):
-                    # 根据 pubDate 判断是否为新内容
-                    pub_date = item.xpath("pubDate")[0].text
-                    pub_date_parsed = time.strptime(
-                        pub_date.replace("GMT", "+0000"),
-                        "%a, %d %b %Y %H:%M:%S %z",
-                    )
-                    pub_date_timestamp = int(time.mktime(pub_date_parsed))
+                pub_date_nodes = item.xpath("pubDate")
+                pub_date = (pub_date_nodes[0].text or "").strip() if pub_date_nodes else ""
+                use_link_fallback = False
+                pub_date_timestamp = 0
+
+                if pub_date:
+                    try:
+                        pub_date_parsed = time.strptime(
+                            pub_date.replace("GMT", "+0000"),
+                            "%a, %d %b %Y %H:%M:%S %z",
+                        )
+                        pub_date_timestamp = int(time.mktime(pub_date_parsed))
+                    except Exception:
+                        self.logger.warning(
+                            f"rss: 条目 pubDate 解析失败，改用 link 去重: {url}"
+                        )
+                        use_link_fallback = True
+                else:
+                    use_link_fallback = True
+
+                if not use_link_fallback:
                     if pub_date_timestamp > after_timestamp:
                         rss_items.append(
                             RSSItem(
@@ -223,7 +250,7 @@ class RssPlugin(Star):
                                 description,
                                 pub_date,
                                 pub_date_timestamp,
-                                pic_url_list
+                                pic_url_list,
                             )
                         )
                         cnt += 1
@@ -232,7 +259,6 @@ class RssPlugin(Star):
                     else:
                         break
                 else:
-                    # 根据 link 判断是否为新内容
                     if link != after_link:
                         rss_items.append(
                             RSSItem(chan_title, title, link, description, "", 0, pic_url_list)
@@ -245,7 +271,7 @@ class RssPlugin(Star):
 
             except Exception as e:
                 self.logger.error(f"rss: 解析Rss条目 {url} 失败: {str(e)}")
-                break
+                continue
 
         return rss_items
 
@@ -256,6 +282,30 @@ class RssPlugin(Star):
                 url = "/" + url
             url = "https://" + url
         return url
+
+    def _normalize_rsshub_base_url(self, base_url: str) -> str:
+        """Normalize RSSHub base URL and trim trailing slash."""
+        base_url = (base_url or "").strip()
+        if not base_url:
+            return ""
+        return base_url.rstrip("/")
+
+    def _get_rsshub_endpoint(self, idx: int) -> str:
+        """Get RSSHub endpoint: indexed endpoint first, config fallback."""
+        if 0 <= idx < len(self.data_handler.data["rsshub_endpoints"]):
+            return self.data_handler.data["rsshub_endpoints"][idx]
+        return self.rsshub_base_url
+
+    def _append_rsshub_query_param(self, url: str) -> str:
+        """为 RSSHub 路由拼接附加查询参数（如 ACCESS_KEY）。"""
+        query = self.rsshub_query_param
+        if not query:
+            return url
+        query = query.lstrip("?&")
+        if not query:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}{query}"
 
     def _fresh_asyncIOScheduler(self):
         """刷新定时任务"""
@@ -278,18 +328,28 @@ class RssPlugin(Star):
     async def _add_url(self, url: str, cron_expr: str, message: AstrMessageEvent):
         """内部方法：添加URL订阅的共用逻辑"""
         user = message.unified_msg_origin
+        latest_item = await self.poll_rss(url)
+        now_ts = int(time.time())
+
+        last_update = now_ts
+        latest_link = ""
+        if latest_item:
+            first_item = latest_item[0]
+            last_update = first_item.pubDate_timestamp or now_ts
+            latest_link = first_item.link or ""
+
         if url in self.data_handler.data:
-            latest_item = await self.poll_rss(url)
             self.data_handler.data[url]["subscribers"][user] = {
                 "cron_expr": cron_expr,
-                "last_update": latest_item[0].pubDate_timestamp,
-                "latest_link": latest_item[0].link,
+                "last_update": last_update,
+                "latest_link": latest_link,
             }
         else:
             try:
                 text = await self.parse_channel_info(url)
+                if text is None:
+                    return message.plain_result("无法访问该 RSS 链接，请检查链接是否可用")
                 title, desc = self.data_handler.parse_channel_text_info(text)
-                latest_item = await self.poll_rss(url)
             except Exception as e:
                 return message.plain_result(f"解析频道信息失败: {str(e)}")
 
@@ -297,8 +357,8 @@ class RssPlugin(Star):
                 "subscribers": {
                     user: {
                         "cron_expr": cron_expr,
-                        "last_update": latest_item[0].pubDate_timestamp,
-                        "latest_link": latest_item[0].link,
+                        "last_update": last_update,
+                        "latest_link": latest_link,
                     }
                 },
                 "info": {
@@ -306,6 +366,7 @@ class RssPlugin(Star):
                     "description": desc,
                 },
             }
+
         self.data_handler.save_data()
         return self.data_handler.data[url]["info"]
 
@@ -386,16 +447,18 @@ class RssPlugin(Star):
     @rsshub.command("list")
     async def rsshub_list(self, event: AstrMessageEvent):
         """列出所有已添加的RSSHub端点"""
-        ret = "当前Bot添加的rsshub endpoint：\n"
-        yield event.plain_result(
-            ret
-            + "\n".join(
-                [
-                    f"{i}: {x}"
-                    for i, x in enumerate(self.data_handler.data["rsshub_endpoints"])
-                ]
-            )
+        lines = []
+        if self.rsshub_base_url:
+            lines.append(f"配置中的默认 endpoint: {self.rsshub_base_url}")
+        lines.extend(
+            [f"{i}: {x}" for i, x in enumerate(self.data_handler.data["rsshub_endpoints"])]
         )
+        if not lines:
+            yield event.plain_result(
+                "当前没有可用的 rsshub endpoint。请先在插件配置中填写 rsshub_base_url，或使用 /rss rsshub add 添加。"
+            )
+            return
+        yield event.plain_result("当前Bot可用的 rsshub endpoint：\n" + "\n".join(lines))
 
     @rsshub.command("remove")
     async def rsshub_remove(self, event: AstrMessageEvent, idx: int):
@@ -429,7 +492,7 @@ class RssPlugin(Star):
         """通过RSSHub路由添加订阅
 
         Args:
-            idx: RSSHub端点索引，可通过/rss rsshub list查看
+            idx: RSSHub端点索引（若配置了 rsshub_base_url，可直接使用 0）
             route: RSSHub路由，需以/开头
             minute: Cron表达式分钟字段
             hour: Cron表达式小时字段
@@ -437,16 +500,21 @@ class RssPlugin(Star):
             month: Cron表达式月份字段
             day_of_week: Cron表达式星期字段
         """
-        if idx < 0 or idx >= len(self.data_handler.data["rsshub_endpoints"]):
+        endpoint = self._get_rsshub_endpoint(idx)
+        if not endpoint:
             yield event.plain_result(
-                "索引越界, 请使用 /rss rsshub list 查看已经添加的 rsshub endpoint"
+                "请先在插件配置中填写 rsshub_base_url，或使用 /rss rsshub add 添加 endpoint"
             )
+            return
+        if not self._is_url_or_ip(endpoint):
+            yield event.plain_result("配置的 rsshub_base_url 不是有效 URL，请检查插件配置")
             return
         if not route.startswith("/"):
             yield event.plain_result("路由必须以 / 开头")
             return
 
-        url = self.data_handler.data["rsshub_endpoints"][idx] + route
+        url = endpoint + route
+        url = self._append_rsshub_query_param(url)
         cron_expr = f"{minute} {hour} {day} {month} {day_of_week}"
 
         ret = await self._add_url(url, cron_expr, event)

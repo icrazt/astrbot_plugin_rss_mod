@@ -13,6 +13,19 @@
         "obvious_hint": true,
         "default": 500
     },
+    "rsshub_base_url": {
+        "description": "RSSHub 实例基础地址。",
+        "type": "string",
+        "hint": "例如：https://rsshub.app",
+        "obvious_hint": true,
+        "default": "https://rsshub.app"
+    },
+    "rsshub_query_param": {
+        "description": "附加到 RSSHub 请求的查询参数。",
+        "type": "string",
+        "hint": "例如 ACCESS_KEY=你的密钥 或 ?access_key=你的密钥",
+        "default": ""
+    },
     "compose": {
         "description": "（仅限qq）是否将消息合并，以转发的方式组合发送",
         "type": "bool",
