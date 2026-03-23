@@ -470,15 +470,8 @@ class RssPlugin(Star):
             self.logger.warning(f"rss: 发送翻译消息失败: {exc}")
 
     def _build_translation_source_text(self, item: RSSItem) -> str:
-        lines = [
-            f"Channel: {item.chan_title}",
-            f"Title: {item.title}",
-            f"Time: {self._format_item_time(item)}",
-        ]
-        if not self.is_hide_url:
-            lines.append(f"Link: {item.link}")
-        lines.extend(["Content:", item.description])
-        return "\n".join(lines).strip()
+        parts = [str(item.title or "").strip(), str(item.description or "").strip()]
+        return "\n".join([p for p in parts if p]).strip()
 
     def _build_language_detection_text(self, item: RSSItem) -> str:
         return "\n".join([item.title or "", item.description or ""]).strip()
@@ -533,7 +526,7 @@ class RssPlugin(Star):
         if not translated_text:
             return None
 
-        return f"译文（{target_language}，时区已转换为 {self.translation_timezone}）:\n{translated_text}"
+        return translated_text
 
     async def _request_translation(
         self,
