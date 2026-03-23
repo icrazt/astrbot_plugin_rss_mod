@@ -32,6 +32,24 @@
         "hint": "例如 Asia/Shanghai、UTC、America/Los_Angeles",
         "default": "Asia/Shanghai"
     },
+    "translate_enabled": {
+        "description": "是否启用 RSS 条目翻译（原文先发送，译文作为第二条消息发送）。",
+        "type": "bool",
+        "default": false
+    },
+    "translate_target_language": {
+        "description": "翻译目标语言代码。",
+        "type": "string",
+        "hint": "例如 zh-Hans、ja、en",
+        "default": "zh-Hans"
+    },
+    "translate_provider_id": {
+        "description": "用于翻译的聊天模型 Provider ID（可选）。",
+        "type": "string",
+        "hint": "留空时自动使用当前会话正在使用的聊天模型。",
+        "default": "",
+        "_special": "select_provider"
+    },
     "compose": {
         "description": "（仅限qq）是否将消息合并，以转发的方式组合发送",
         "type": "bool",

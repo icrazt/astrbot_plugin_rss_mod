@@ -3,6 +3,7 @@ import asyncio
 import time
 import re
 import logging
+import hashlib
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from lxml import etree
@@ -16,7 +17,7 @@ import astrbot.api.message_components as Comp
 from .data_handler import DataHandler
 from .pic_handler import RssImageHandler
 from .rss import RSSItem
-from typing import List
+from typing import List, Optional
 
 
 @register(
@@ -50,12 +51,32 @@ class RssPlugin(Star):
         self.rsshub_query_param = (config.get("rsshub_query_param") or "").strip()
         self.message_timezone = (config.get("message_timezone") or "Asia/Shanghai").strip() or "Asia/Shanghai"
         self._target_tz = self._load_target_timezone(self.message_timezone)
+        self.translation_timezone = self.message_timezone if isinstance(self._target_tz, ZoneInfo) else "UTC"
+        self.translate_enabled = self._cfg_bool("translate_enabled", False)
+        self.translate_target_language = self._cfg_str("translate_target_language", "zh-Hans")
+        self.translate_provider_id = self._cfg_str("translate_provider_id", "")
 
         self.pic_handler = RssImageHandler(self.is_adjust_pic)
         self.scheduler = AsyncIOScheduler()
         self.scheduler.start()
 
         self._fresh_asyncIOScheduler()
+
+    async def terminate(self):
+        """插件卸载时关闭调度器，避免热重载后重复触发。"""
+        try:
+            self.scheduler.remove_all_jobs()
+        except Exception as exc:
+            self.logger.warning(f"rss: terminate remove_all_jobs failed: {exc}")
+        try:
+            if self.scheduler.running:
+                self.scheduler.shutdown(wait=False)
+        except Exception as exc:
+            self.logger.warning(f"rss: terminate scheduler shutdown failed: {exc}")
+
+    def _build_job_id(self, url: str, user: str) -> str:
+        digest = hashlib.md5(f"{url}|{user}".encode("utf-8")).hexdigest()
+        return f"rss_job_{digest}"
 
     def parse_cron_expr(self, cron_expr: str):
         fields = cron_expr.split(" ")
@@ -125,10 +146,10 @@ class RssPlugin(Star):
             for item in rss_items:
                 comps = await self._get_chain_components(item)
                 node = Comp.Node(
-                            uin=0,
-                            name="Astrbot",
-                            content=comps
-                        )
+                    uin=0,
+                    name="Astrbot",
+                    content=comps
+                )
                 nodes.append(node)
                 self.data_handler.data[url]["subscribers"][user]["last_update"] = int(
                     time.time()
@@ -139,18 +160,21 @@ class RssPlugin(Star):
             if len(nodes) > 0:
                 msc = MessageChain(
                     chain=nodes,
-                    use_t2i_= self.t2i
+                    use_t2i_=self.t2i
                 )
                 await self.context.send_message(user, msc)
+                for item in rss_items:
+                    await self._send_translation_followup(user, item)
         else:
             # 每个消息单独发送
             for item in rss_items:
                 comps = await self._get_chain_components(item)
                 msc = MessageChain(
-                chain=comps,
-                use_t2i_= self.t2i
-            )
+                    chain=comps,
+                    use_t2i_=self.t2i
+                )
                 await self.context.send_message(user, msc)
+                await self._send_translation_followup(user, item)
                 self.data_handler.data[url]["subscribers"][user]["last_update"] = int(
                     time.time()
                 )
@@ -352,9 +376,12 @@ class RssPlugin(Star):
             if url == "rsshub_endpoints" or url == "settings":
                 continue
             for user, sub_info in info["subscribers"].items():
+                job_id = self._build_job_id(url, user)
                 self.scheduler.add_job(
                     self.cron_task_callback,
                     "cron",
+                    id=job_id,
+                    replace_existing=True,
                     **self.parse_cron_expr(sub_info["cron_expr"]),
                     args=[url, user],
                 )
@@ -431,6 +458,230 @@ class RssPlugin(Star):
                 else:
                     comps.append(Comp.Image.fromBase64(base64str))
         return comps
+
+    async def _send_translation_followup(self, umo: str, item: RSSItem) -> None:
+        try:
+            translated_text = await self._translate_item_text(umo=umo, item=item)
+            if not translated_text:
+                return
+            message_chain = MessageChain(chain=[Comp.Plain(translated_text + "\n")], use_t2i_=self.t2i)
+            await self.context.send_message(umo, message_chain)
+        except Exception as exc:
+            self.logger.warning(f"rss: 发送翻译消息失败: {exc}")
+
+    def _build_translation_source_text(self, item: RSSItem) -> str:
+        lines = [
+            f"Channel: {item.chan_title}",
+            f"Title: {item.title}",
+            f"Time: {self._format_item_time(item)}",
+        ]
+        if not self.is_hide_url:
+            lines.append(f"Link: {item.link}")
+        lines.extend(["Content:", item.description])
+        return "\n".join(lines).strip()
+
+    def _build_language_detection_text(self, item: RSSItem) -> str:
+        return "\n".join([item.title or "", item.description or ""]).strip()
+
+    async def _translate_item_text(self, umo: str, item: RSSItem) -> Optional[str]:
+        if not self.translate_enabled:
+            return None
+
+        target_language = self.translate_target_language
+        if not target_language:
+            return None
+
+        source_text = self._build_translation_source_text(item)
+        if not source_text:
+            return None
+        detection_text = self._build_language_detection_text(item) or source_text
+
+        provider_id = self.translate_provider_id
+        if not provider_id:
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            except Exception as exc:
+                self.logger.warning(f"rss: 获取翻译 provider 失败: {exc}")
+                return None
+
+        if not provider_id:
+            self.logger.warning("rss: 未找到可用翻译 provider，跳过翻译")
+            return None
+
+        detected_language = await self._detect_language(provider_id, detection_text)
+        if detected_language and self._language_matches_target(detected_language, target_language):
+            self.logger.info(
+                f"rss: 检测到语言 {detected_language} 与目标语言 {target_language} 匹配，跳过翻译",
+            )
+            return None
+
+        translated_text = await self._request_translation(
+            provider_id=provider_id,
+            target_language=target_language,
+            text=source_text,
+            system_prompt="你是翻译助手。只输出翻译结果，不要解释。",
+        )
+
+        if not translated_text or translated_text == source_text:
+            translated_text = await self._request_translation(
+                provider_id=provider_id,
+                target_language=target_language,
+                text=source_text,
+                system_prompt="Translate the given text and output translation only.",
+            )
+
+        if not translated_text:
+            return None
+
+        return f"译文（{target_language}，时区已转换为 {self.translation_timezone}）:\n{translated_text}"
+
+    async def _request_translation(
+        self,
+        provider_id: str,
+        target_language: str,
+        text: str,
+        system_prompt: str,
+    ) -> Optional[str]:
+        prompt = (
+            f"请将以下 RSS 文本翻译为 {target_language}。\n"
+            f"若文本中包含具体时间、日期、时区信息，请换算并统一为 {self.translation_timezone} 时区后再输出。\n"
+            "保持原文结构，仅输出翻译结果，不要解释：\n\n"
+            f"{text}"
+        )
+        try:
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                system_prompt=system_prompt,
+                prompt=prompt,
+            )
+            translated_text = (llm_resp.completion_text or "").strip()
+            return translated_text or None
+        except Exception as exc:
+            self.logger.warning(f"rss: 翻译请求失败: {exc}")
+            return None
+
+    async def _detect_language(
+        self,
+        provider_id: str,
+        text: str,
+    ) -> Optional[str]:
+        detected_by_google = await self._detect_language_by_google(text)
+        if detected_by_google:
+            self.logger.info(
+                f"rss: language detection API=GoogleFree detected={detected_by_google}",
+            )
+            return detected_by_google
+
+        self.logger.info("rss: language detection GoogleFree unavailable, fallback to LLM")
+        detected_by_llm = await self._detect_language_by_llm(provider_id, text)
+        if detected_by_llm:
+            self.logger.info(
+                f"rss: language detection API=LLM provider={provider_id} detected={detected_by_llm}",
+            )
+        return detected_by_llm
+
+    async def _detect_language_by_google(self, text: str) -> Optional[str]:
+        sample_text = text.strip()
+        if not sample_text:
+            return None
+
+        if len(sample_text) > 2000:
+            sample_text = sample_text[:2000]
+
+        api_url = "https://translate.googleapis.com/translate_a/single"
+        timeout = aiohttp.ClientTimeout(total=20)
+        headers = {"User-Agent": "astrbot-plugin-rss/1.1.2"}
+        params = {
+            "client": "gtx",
+            "sl": "auto",
+            "tl": "en",
+            "dt": "t",
+            "q": sample_text,
+        }
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(api_url, params=params) as response:
+                    if response.status >= 400:
+                        self.logger.warning(
+                            f"rss: Google language detect HTTP {response.status}",
+                        )
+                        return None
+                    data = await response.json(content_type=None)
+        except Exception as exc:
+            self.logger.warning(f"rss: Google language detect failed: {exc}")
+            return None
+
+        detected_language = None
+        if isinstance(data, list) and len(data) >= 3 and isinstance(data[2], str):
+            detected_language = data[2].strip()
+
+        if not detected_language:
+            self.logger.warning("rss: Google language detect returned unexpected payload")
+            return None
+
+        code_match = re.search(
+            r"\b([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*)\b",
+            detected_language,
+        )
+        if not code_match:
+            self.logger.warning("rss: Google language detect returned invalid language code")
+            return None
+        return code_match.group(1)
+
+    async def _detect_language_by_llm(
+        self,
+        provider_id: str,
+        text: str,
+    ) -> Optional[str]:
+        try:
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                system_prompt=(
+                    "你是语言识别助手。只返回语言代码，如 en、zh-Hans、ja。"
+                ),
+                prompt=text,
+            )
+            response_text = (llm_resp.completion_text or "").strip()
+        except Exception as exc:
+            self.logger.warning(f"rss: fallback LLM language detection failed: {exc}")
+            return None
+
+        code_match = re.search(
+            r"\b([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*)\b",
+            response_text,
+        )
+        if not code_match:
+            self.logger.warning("rss: fallback LLM language detection returned invalid language code")
+            return None
+        return code_match.group(1)
+
+    def _language_matches_target(self, detected: str, target: str) -> bool:
+        detected_norm = detected.strip().lower().replace("_", "-")
+        target_norm = target.strip().lower().replace("_", "-")
+        if not detected_norm or not target_norm:
+            return False
+        if detected_norm == target_norm:
+            return True
+        if detected_norm.startswith(target_norm) or target_norm.startswith(detected_norm):
+            return True
+        if detected_norm.startswith("zh") and target_norm.startswith("zh"):
+            return True
+        return False
+
+    def _cfg_str(self, key: str, default: str = "") -> str:
+        value = self.config.get(key, default)
+        if value is None:
+            return default
+        return str(value).strip()
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        value = self.config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
 
     def _is_url_or_ip(self,text: str) -> bool:
         """
@@ -675,3 +926,7 @@ class RssPlugin(Star):
             yield event.chain_result([node]).use_t2i(self.t2i)
         else:
             yield event.chain_result(comps).use_t2i(self.t2i)
+
+        translated_text = await self._translate_item_text(event.unified_msg_origin, item)
+        if translated_text:
+            yield event.chain_result([Comp.Plain(translated_text + "\n")]).use_t2i(self.t2i)
