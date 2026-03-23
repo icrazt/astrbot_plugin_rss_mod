@@ -3,6 +3,8 @@ import asyncio
 import time
 import re
 import logging
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from lxml import etree
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -46,6 +48,8 @@ class RssPlugin(Star):
         self.is_compose = config.get("compose")
         self.rsshub_base_url = self._normalize_rsshub_base_url(config.get("rsshub_base_url") or "")
         self.rsshub_query_param = (config.get("rsshub_query_param") or "").strip()
+        self.message_timezone = (config.get("message_timezone") or "Asia/Shanghai").strip() or "Asia/Shanghai"
+        self._target_tz = self._load_target_timezone(self.message_timezone)
 
         self.pic_handler = RssImageHandler(self.is_adjust_pic)
         self.scheduler = AsyncIOScheduler()
@@ -227,11 +231,11 @@ class RssPlugin(Star):
 
                 if pub_date:
                     try:
-                        pub_date_parsed = time.strptime(
+                        pub_date_dt = datetime.strptime(
                             pub_date.replace("GMT", "+0000"),
                             "%a, %d %b %Y %H:%M:%S %z",
                         )
-                        pub_date_timestamp = int(time.mktime(pub_date_parsed))
+                        pub_date_timestamp = int(pub_date_dt.timestamp())
                     except Exception:
                         self.logger.warning(
                             f"rss: 条目 pubDate 解析失败，改用 link 去重: {url}"
@@ -307,6 +311,36 @@ class RssPlugin(Star):
         separator = "&" if "?" in url else "?"
         return f"{url}{separator}{query}"
 
+    def _load_target_timezone(self, timezone_name: str):
+        """加载目标时区，非法时区自动回退到 UTC。"""
+        try:
+            return ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            self.logger.warning(
+                f"rss: 无效时区配置 {timezone_name}，已自动回退到 UTC"
+            )
+            return timezone.utc
+
+    def _format_item_time(self, item: RSSItem) -> str:
+        """将 RSS 条目时间转换为配置时区后格式化。"""
+        if item.pubDate:
+            try:
+                dt = datetime.strptime(
+                    item.pubDate.replace("GMT", "+0000"),
+                    "%a, %d %b %Y %H:%M:%S %z",
+                )
+                local_dt = dt.astimezone(self._target_tz)
+                return local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+            except Exception:
+                pass
+
+        if item.pubDate_timestamp > 0:
+            dt = datetime.fromtimestamp(item.pubDate_timestamp, tz=timezone.utc)
+            local_dt = dt.astimezone(self._target_tz)
+            return local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+        return "未知"
+
     def _fresh_asyncIOScheduler(self):
         """刷新定时任务"""
         # 删除所有定时任务
@@ -373,10 +407,19 @@ class RssPlugin(Star):
     async def _get_chain_components(self, item: RSSItem):
         """组装消息链"""
         comps = []
-        comps.append(Comp.Plain(f"频道 {item.chan_title} 最新 Feed\n---\n标题: {item.title}\n---\n"))
+        time_text = self._format_item_time(item)
+
+        header_lines = [
+            f"频道 {item.chan_title} 最新 Feed",
+            f"标题: {item.title}",
+            f"时间: {time_text}",
+        ]
         if not self.is_hide_url:
-            comps.append(Comp.Plain(f"链接: {item.link}\n---\n"))
-        comps.append(Comp.Plain(item.description+"\n---\n"))
+            header_lines.append(f"链接: {item.link}")
+
+        comps.append(Comp.Plain("\n".join(header_lines) + "\n"))
+        comps.append(Comp.Plain(item.description + "\n"))
+
         if self.is_read_pic and item.pic_urls:
             # 如果max_pic_item为-1则不限制图片数量
             temp_max_pic_item = len(item.pic_urls) if self.max_pic_item == -1 else self.max_pic_item
@@ -388,7 +431,6 @@ class RssPlugin(Star):
                 else:
                     comps.append(Comp.Image.fromBase64(base64str))
         return comps
-
 
     def _is_url_or_ip(self,text: str) -> bool:
         """

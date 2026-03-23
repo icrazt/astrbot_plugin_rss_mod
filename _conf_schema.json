@@ -26,6 +26,12 @@
         "hint": "例如 ACCESS_KEY=你的密钥 或 ?access_key=你的密钥",
         "default": ""
     },
+    "message_timezone": {
+        "description": "消息时间显示使用的目标时区。",
+        "type": "string",
+        "hint": "例如 Asia/Shanghai、UTC、America/Los_Angeles",
+        "default": "Asia/Shanghai"
+    },
     "compose": {
         "description": "（仅限qq）是否将消息合并，以转发的方式组合发送",
         "type": "bool",
