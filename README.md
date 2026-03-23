@@ -12,6 +12,7 @@
 - 添加、列出和删除 RSSHub endpoint
 - 通过 RSSHub 路由订阅 RSS 源
 - 直接通过 URL 订阅 RSS 源
+- 定时任务改为使用 Astr 内置 A1-futuretask（FutureTask），可在 WebUI 的“未来任务”中查看
 - 列出所有订阅
 - 删除订阅
 - 获取最新一条订阅内容

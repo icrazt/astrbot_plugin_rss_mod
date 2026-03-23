@@ -3,11 +3,9 @@ import asyncio
 import time
 import re
 import logging
-import hashlib
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from lxml import etree
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult,MessageChain
 from astrbot.api.star import Context, Star, register
@@ -24,7 +22,7 @@ from typing import List, Optional
     "astrbot_plugin_rss",
     "Soulter",
     "RSS订阅插件",
-    "1.1.0",
+    "1.1.3",
     "https://github.com/Soulter/astrbot_plugin_rss",
 )
 class RssPlugin(Star):
@@ -57,36 +55,39 @@ class RssPlugin(Star):
         self.translate_provider_id = self._cfg_str("translate_provider_id", "")
 
         self.pic_handler = RssImageHandler(self.is_adjust_pic)
-        self.scheduler = AsyncIOScheduler()
-        self.scheduler.start()
+        self._future_task_plugin_id = "astrbot_plugin_rss_mod"
+        self._cron_refresh_lock = asyncio.Lock()
+        self._cron_sync_task: asyncio.Task | None = None
 
-        self._fresh_asyncIOScheduler()
+    async def initialize(self):
+        """插件加载后在 cron manager 就绪后同步 FutureTask。"""
+        self._cron_sync_task = asyncio.create_task(self._wait_and_refresh_future_tasks())
 
     async def terminate(self):
-        """插件卸载时关闭调度器，避免热重载后重复触发。"""
-        try:
-            self.scheduler.remove_all_jobs()
-        except Exception as exc:
-            self.logger.warning(f"rss: terminate remove_all_jobs failed: {exc}")
-        try:
-            if self.scheduler.running:
-                self.scheduler.shutdown(wait=False)
-        except Exception as exc:
-            self.logger.warning(f"rss: terminate scheduler shutdown failed: {exc}")
+        """插件卸载时删除插件创建的 FutureTask，避免热重载后重复触发。"""
+        if self._cron_sync_task and not self._cron_sync_task.done():
+            self._cron_sync_task.cancel()
+            try:
+                await self._cron_sync_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self.logger.warning(f"rss: terminate cron sync task failed: {exc}")
+        await self._cleanup_future_tasks()
 
-    def _build_job_id(self, url: str, user: str) -> str:
-        digest = hashlib.md5(f"{url}|{user}".encode("utf-8")).hexdigest()
-        return f"rss_job_{digest}"
+    async def _wait_and_refresh_future_tasks(self):
+        cron_mgr = getattr(self.context, "cron_manager", None)
+        if cron_mgr is None:
+            self.logger.warning("rss: cron_manager is unavailable, skip initial FutureTask sync")
+            return
 
-    def parse_cron_expr(self, cron_expr: str):
-        fields = cron_expr.split(" ")
-        return {
-            "minute": fields[0],
-            "hour": fields[1],
-            "day": fields[2],
-            "month": fields[3],
-            "day_of_week": fields[4],
-        }
+        for _ in range(100):
+            if getattr(cron_mgr, "_started", False) and hasattr(cron_mgr, "ctx"):
+                await self._refresh_future_tasks()
+                return
+            await asyncio.sleep(0.1)
+
+        self.logger.warning("rss: cron_manager not ready in time, skip initial FutureTask sync")
 
     async def parse_channel_info(self, url):
         headers = {
@@ -116,7 +117,7 @@ class RssPlugin(Star):
             self.logger.error(f"rss: 请求站点 {url} 发生未知错误: {str(e)}")
             return None
 
-    async def cron_task_callback(self, url: str, user: str):
+    async def cron_task_callback(self, url: str, user: str, **_kwargs):
         """定时任务回调"""
 
         if url not in self.data_handler.data:
@@ -365,26 +366,84 @@ class RssPlugin(Star):
 
         return "未知"
 
-    def _fresh_asyncIOScheduler(self):
-        """刷新定时任务"""
-        # 删除所有定时任务
-        self.logger.info("刷新定时任务")
-        self.scheduler.remove_all_jobs()
+    async def _cleanup_future_tasks(self):
+        cron_mgr = getattr(self.context, "cron_manager", None)
+        if cron_mgr is None:
+            return
 
-        # 为每个订阅添加定时任务
-        for url, info in self.data_handler.data.items():
-            if url == "rsshub_endpoints" or url == "settings":
+        try:
+            jobs = await cron_mgr.list_jobs("basic")
+        except Exception as exc:
+            self.logger.warning(f"rss: failed to list FutureTask jobs: {exc}")
+            return
+
+        for job in jobs:
+            payload = job.payload if isinstance(job.payload, dict) else {}
+            if payload.get("plugin") != self._future_task_plugin_id:
                 continue
-            for user, sub_info in info["subscribers"].items():
-                job_id = self._build_job_id(url, user)
-                self.scheduler.add_job(
-                    self.cron_task_callback,
-                    "cron",
-                    id=job_id,
-                    replace_existing=True,
-                    **self.parse_cron_expr(sub_info["cron_expr"]),
-                    args=[url, user],
-                )
+            try:
+                await cron_mgr.delete_job(job.job_id)
+            except Exception as exc:
+                self.logger.warning(f"rss: failed to delete FutureTask job {job.job_id}: {exc}")
+
+    async def _refresh_future_tasks(self):
+        async with self._cron_refresh_lock:
+            cron_mgr = getattr(self.context, "cron_manager", None)
+            if cron_mgr is None:
+                self.logger.warning("rss: cron_manager is unavailable, skip FutureTask sync")
+                return
+
+            self.logger.info("rss: refreshing FutureTask jobs")
+            await self._cleanup_future_tasks()
+
+            data_changed = False
+            for url, info in self.data_handler.data.items():
+                if url == "rsshub_endpoints" or url == "settings":
+                    continue
+
+                chan_title = ((info.get("info") or {}).get("title") or url).strip()
+                job_name = f"RSS feed push: {chan_title}"[:120]
+                subscribers = info.get("subscribers") or {}
+
+                for user, sub_info in subscribers.items():
+                    if not isinstance(sub_info, dict):
+                        continue
+
+                    if "future_task_id" in sub_info:
+                        sub_info.pop("future_task_id", None)
+                        data_changed = True
+
+                    cron_expr = str(sub_info.get("cron_expr") or "").strip()
+                    if not cron_expr:
+                        self.logger.warning(f"rss: missing cron_expr, skipped: {url} - {user}")
+                        continue
+
+                    session_id = user.split(":", 2)[2] if ":" in user else user
+                    payload = {
+                        "plugin": self._future_task_plugin_id,
+                        "url": url,
+                        "user": user,
+                        "session": user,
+                        "session_id": session_id,
+                    }
+
+                    try:
+                        job = await cron_mgr.add_basic_job(
+                            name=job_name,
+                            cron_expression=cron_expr,
+                            handler=self.cron_task_callback,
+                            description=f"RSS push: {url} -> {user}",
+                            payload=payload,
+                            enabled=True,
+                            persistent=False,
+                        )
+                        sub_info["future_task_id"] = job.job_id
+                        data_changed = True
+                    except Exception as exc:
+                        self.logger.warning(f"rss: failed to create FutureTask job {url} - {user}: {exc}")
+
+            if data_changed:
+                self.data_handler.save_data()
 
     async def _add_url(self, url: str, cron_expr: str, message: AstrMessageEvent):
         """内部方法：添加URL订阅的共用逻辑"""
@@ -757,8 +816,6 @@ class RssPlugin(Star):
             yield event.plain_result("索引越界")
             return
         else:
-            # TODO:删除对应的定时任务
-            self.scheduler.remove_job()
             self.data_handler.data["rsshub_endpoints"].pop(idx)
             self.data_handler.save_data()
             yield event.plain_result("删除成功")
@@ -812,7 +869,7 @@ class RssPlugin(Star):
             chan_desc = ret["description"]
 
         # 刷新定时任务
-        self._fresh_asyncIOScheduler()
+        await self._refresh_future_tasks()
 
         yield event.plain_result(
             f"添加成功。频道信息：\n标题: {chan_title}\n描述: {chan_desc}"
@@ -849,7 +906,7 @@ class RssPlugin(Star):
             chan_desc = ret["description"]
 
         # 刷新定时任务
-        self._fresh_asyncIOScheduler()
+        await self._refresh_future_tasks()
 
         yield event.plain_result(
             f"添加成功。频道信息：\n标题: {chan_title}\n描述: {chan_desc}"
@@ -885,7 +942,7 @@ class RssPlugin(Star):
         self.data_handler.save_data()
 
         # 刷新定时任务
-        self._fresh_asyncIOScheduler()
+        await self._refresh_future_tasks()
         yield event.plain_result("删除成功")
 
     @rss.command("get")
