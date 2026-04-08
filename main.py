@@ -4,6 +4,7 @@ import time
 import re
 import logging
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from lxml import etree
 
@@ -126,9 +127,15 @@ class RssPlugin(Star):
             return
 
         self.logger.info(f"RSS 定时任务触发: {url} - {user}")
-        last_update = self.data_handler.data[url]["subscribers"][user]["last_update"]
-        latest_link = self.data_handler.data[url]["subscribers"][user]["latest_link"]
+        sub_info = self.data_handler.data[url]["subscribers"][user]
+        last_update = sub_info["last_update"]
+        latest_link = sub_info["latest_link"]
         max_items_per_poll = self.max_items_per_poll
+
+        # 已发送链接集合，用于避免重复发送（尤其是 future-dated 条目）
+        sent_links_list: list = sub_info.get("sent_links", [])
+        sent_links_set = set(sent_links_list)
+
         # 拉取 RSS
         rss_items = await self.poll_rss(
             url,
@@ -136,6 +143,10 @@ class RssPlugin(Star):
             after_timestamp=last_update,
             after_link=latest_link,
         )
+
+        # 过滤掉已发送过的条目
+        rss_items = [item for item in rss_items if item.link not in sent_links_set]
+
         max_ts = last_update
 
         # 分解MessageSesion
@@ -152,9 +163,6 @@ class RssPlugin(Star):
                     content=comps
                 )
                 nodes.append(node)
-                self.data_handler.data[url]["subscribers"][user]["last_update"] = int(
-                    time.time()
-                )
                 max_ts = max(max_ts, item.pubDate_timestamp)
 
             # 合并消息发送
@@ -176,22 +184,58 @@ class RssPlugin(Star):
                 )
                 await self.context.send_message(user, msc)
                 await self._send_translation_followup(user, item)
-                self.data_handler.data[url]["subscribers"][user]["last_update"] = int(
-                    time.time()
-                )
                 max_ts = max(max_ts, item.pubDate_timestamp)
 
         # 更新最后更新时间
         if rss_items:
-            self.data_handler.data[url]["subscribers"][user]["last_update"] = max_ts
-            self.data_handler.data[url]["subscribers"][user]["latest_link"] = rss_items[
-                0
-            ].link
+            now_ts = int(time.time())
+            # 将 last_update 限制为当前时间，防止 future-dated 条目
+            # （如计划维护）导致后续轮询遗漏正常时间线内的新条目
+            sub_info["last_update"] = min(max_ts, now_ts)
+            sub_info["latest_link"] = rss_items[-1].link
+
+            # 记录已发送过的链接，避免重复推送
+            for item in rss_items:
+                sent_links_list.append(item.link)
+            if len(sent_links_list) > 200:
+                sent_links_list = sent_links_list[-200:]
+            sub_info["sent_links"] = sent_links_list
+
             self.data_handler.save_data()
             self.logger.info(f"RSS 定时任务 {url} 推送成功 - {user}")
         else:
             self.logger.info(f"RSS 定时任务 {url} 无消息更新 - {user}")
 
+
+    def _parse_pub_date(self, pub_date: str) -> int:
+        """解析 RSS pubDate 字符串为 Unix 时间戳。
+
+        支持 RFC 2822（RSS 标准）和 ISO 8601（Atom 常见）格式。
+        """
+        if not pub_date:
+            return 0
+        # RFC 2822 (标准 RSS 日期格式)
+        try:
+            dt = parsedate_to_datetime(pub_date)
+            return int(dt.timestamp())
+        except Exception:
+            pass
+        # dateutil / strptime 手动兜底: 带 GMT 的旧式日期
+        try:
+            dt = datetime.strptime(
+                pub_date.replace("GMT", "+0000"),
+                "%a, %d %b %Y %H:%M:%S %z",
+            )
+            return int(dt.timestamp())
+        except Exception:
+            pass
+        # ISO 8601 (部分 Atom feed 使用)
+        try:
+            dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
+            return int(dt.timestamp())
+        except Exception:
+            pass
+        return 0
 
     async def poll_rss(
         self,
@@ -206,7 +250,10 @@ class RssPlugin(Star):
             self.logger.error(f"rss: 无法解析站点 {url} 的RSS信息")
             return []
         root = etree.fromstring(text)
+        # 同时支持 RSS 2.0 (<item>) 和 Atom (<entry>) 格式
         items = root.xpath("//item")
+        if not items:
+            items = root.xpath("//*[local-name()='entry']")
 
         cnt = 0
         rss_items = []
@@ -219,7 +266,7 @@ class RssPlugin(Star):
                     else "未知频道"
                 )
 
-                title_nodes = item.xpath("title")
+                title_nodes = item.xpath("title") or item.xpath("*[local-name()='title']")
                 title = (title_nodes[0].text or "").strip() if title_nodes else ""
                 if not title:
                     title = "(无标题)"
@@ -228,6 +275,14 @@ class RssPlugin(Star):
 
                 link_nodes = item.xpath("link")
                 link = (link_nodes[0].text or "").strip() if link_nodes else ""
+                # Atom feed: <link href="..."/>
+                if not link:
+                    atom_link_nodes = item.xpath("*[local-name()='link']")
+                    for aln in atom_link_nodes:
+                        href = (aln.get("href") or "").strip()
+                        if href:
+                            link = href
+                            break
                 if not link:
                     self.logger.warning(f"rss: 条目缺少 link，已跳过: {url}")
                     continue
@@ -235,6 +290,8 @@ class RssPlugin(Star):
                     link = self.data_handler.get_root_url(url) + link
 
                 description_nodes = item.xpath("description")
+                if not description_nodes:
+                    description_nodes = item.xpath("*[local-name()='summary']") or item.xpath("*[local-name()='content']")
                 description_html = (
                     description_nodes[0].text if description_nodes else ""
                 ) or ""
@@ -250,18 +307,18 @@ class RssPlugin(Star):
                     )
 
                 pub_date_nodes = item.xpath("pubDate")
+                if not pub_date_nodes:
+                    pub_date_nodes = (
+                        item.xpath("*[local-name()='updated']")
+                        or item.xpath("*[local-name()='published']")
+                    )
                 pub_date = (pub_date_nodes[0].text or "").strip() if pub_date_nodes else ""
                 use_link_fallback = False
                 pub_date_timestamp = 0
 
                 if pub_date:
-                    try:
-                        pub_date_dt = datetime.strptime(
-                            pub_date.replace("GMT", "+0000"),
-                            "%a, %d %b %Y %H:%M:%S %z",
-                        )
-                        pub_date_timestamp = int(pub_date_dt.timestamp())
-                    except Exception:
+                    pub_date_timestamp = self._parse_pub_date(pub_date)
+                    if pub_date_timestamp == 0:
                         self.logger.warning(
                             f"rss: 条目 pubDate 解析失败，改用 link 去重: {url}"
                         )
@@ -286,7 +343,9 @@ class RssPlugin(Star):
                         if num != -1 and cnt >= num:
                             break
                     else:
-                        break
+                        # 不使用 break，继续扫描后续条目
+                        # 部分 feed（如 Statuspage）条目并非严格按时间倒序排列
+                        continue
                 else:
                     if link != after_link:
                         rss_items.append(
@@ -349,15 +408,11 @@ class RssPlugin(Star):
     def _format_item_time(self, item: RSSItem) -> str:
         """将 RSS 条目时间转换为配置时区后格式化。"""
         if item.pubDate:
-            try:
-                dt = datetime.strptime(
-                    item.pubDate.replace("GMT", "+0000"),
-                    "%a, %d %b %Y %H:%M:%S %z",
-                )
+            ts = self._parse_pub_date(item.pubDate)
+            if ts > 0:
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
                 local_dt = dt.astimezone(self._target_tz)
                 return local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-            except Exception:
-                pass
 
         if item.pubDate_timestamp > 0:
             dt = datetime.fromtimestamp(item.pubDate_timestamp, tz=timezone.utc)
@@ -455,7 +510,10 @@ class RssPlugin(Star):
         latest_link = ""
         if latest_item:
             first_item = latest_item[0]
-            last_update = first_item.pubDate_timestamp or now_ts
+            # 将 last_update 限制为当前时间，防止 feed 中包含
+            # future-dated 条目（如计划维护）时跳过正常时间线的新条目
+            ts = first_item.pubDate_timestamp or now_ts
+            last_update = min(ts, now_ts)
             latest_link = first_item.link or ""
 
         if url in self.data_handler.data:
@@ -463,6 +521,7 @@ class RssPlugin(Star):
                 "cron_expr": cron_expr,
                 "last_update": last_update,
                 "latest_link": latest_link,
+                "sent_links": [],
             }
         else:
             try:
@@ -479,6 +538,7 @@ class RssPlugin(Star):
                         "cron_expr": cron_expr,
                         "last_update": last_update,
                         "latest_link": latest_link,
+                        "sent_links": [],
                     }
                 },
                 "info": {
